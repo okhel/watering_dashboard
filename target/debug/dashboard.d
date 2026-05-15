@@ -1,1 +1,0 @@
-/Users/ole/Documents/Garden\ Watering\ DIY/dashboard/target/debug/dashboard: /Users/ole/Documents/Garden\ Watering\ DIY/dashboard/src/../../proto.rs /Users/ole/Documents/Garden\ Watering\ DIY/dashboard/src/main.rs
