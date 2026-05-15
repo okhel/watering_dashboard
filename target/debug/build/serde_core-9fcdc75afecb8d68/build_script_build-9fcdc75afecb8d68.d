@@ -1,0 +1,5 @@
+/Users/ole/Documents/Garden Watering DIY/dashboard/target/debug/build/serde_core-9fcdc75afecb8d68/build_script_build-9fcdc75afecb8d68.d: /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.228/build.rs
+
+/Users/ole/Documents/Garden Watering DIY/dashboard/target/debug/build/serde_core-9fcdc75afecb8d68/build_script_build-9fcdc75afecb8d68: /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.228/build.rs
+
+/Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.228/build.rs:

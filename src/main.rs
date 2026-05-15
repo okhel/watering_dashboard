@@ -1,18 +1,15 @@
 //! Garden dashboard — TCP server that receives moisture/pump messages
 //! from the ESP32 node and logs them to stdout.
 //!
-//! Wire framing (see proto.rs): big-endian u16 length + postcard payload.
+//! Wire framing: big-endian u16 length + JSON payload.
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 
-// Single source of truth lives at the project root. Will become a proper
-// shared crate once we move firmware + dashboard into a Cargo workspace.
-#[path = "../../proto.rs"]
-mod proto;
-use proto::Message;
-
-const BIND_ADDR: &str = "0.0.0.0:5000";
+mod config;
+mod types;
+use config::BIND_ADDR;
+use types::Message;
 
 fn handle(mut stream: TcpStream) -> std::io::Result<()> {
     let peer = stream.peer_addr()?;
@@ -28,7 +25,7 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload)?;
 
-        match postcard::from_bytes::<Message>(&payload) {
+        match serde_json::from_slice::<Message>(&payload) {
             Ok(msg) => {
                 let ts = chrono::Utc::now().to_rfc3339();
                 println!("[{ts}] {msg:?}");
