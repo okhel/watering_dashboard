@@ -3,13 +3,13 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use std::thread;
-use chrono::Local;
+use chrono::{Local, NaiveDateTime, TimeZone};
 use axum::{Router, routing::{get, post}, extract::State, Json};
 use axum::http::StatusCode;
 use axum::response::Html;
 mod config;
 mod types;
-use config::{BIND_ADDR, HTTP_ADDR, LIVENESS_SECS, MAX_EVENTS};
+use config::{BIND_ADDR, HTTP_ADDR, LIVENESS_SECS, RAW_WINDOW_SECS, RETAIN_SECS};
 use types::{ApiData, LogEntry, Message, WaterRequest};
 
 struct SharedState {
@@ -80,17 +80,92 @@ fn node_session(stream: TcpStream, state: &Arc<SharedState>) -> std::io::Result<
                 println!("[{}] {msg:?}", Local::now().format("%H:%M:%S"));
                 let mut log = state.log.lock().unwrap();
                 log.push(LogEntry { timestamp: Local::now().to_rfc3339(), message: msg });
-                if log.len() > MAX_EVENTS { log.remove(0); }
+                compact_log(&mut log);
             }
             Err(e) => eprintln!("decode error ({len} bytes): {e}"),
         }
     }
 }
 
+// --- Log compaction ---
+//
+// Called after every new entry. Keeps:
+//   • all events (pump/water) verbatim — they're sparse and always useful
+//   • moisture readings from the last RAW_WINDOW_SECS verbatim
+//   • moisture readings older than that collapsed to one average per hour
+//   • nothing older than RETAIN_SECS
+
+fn compact_log(log: &mut Vec<LogEntry>) {
+    let now_secs  = Local::now().timestamp();
+    let cutoff    = now_secs - RETAIN_SECS;
+    let raw_edge  = now_secs - RAW_WINDOW_SECS;
+
+    // Drop everything beyond the retention window
+    log.retain(|e| {
+        chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+            .map(|t| t.timestamp() > cutoff)
+            .unwrap_or(false)
+    });
+
+    // Split moisture entries into raw (recent) vs. to-be-averaged (older)
+    let mut recent:       Vec<LogEntry> = Vec::new();
+    let mut to_average:   Vec<LogEntry> = Vec::new();
+    let mut non_moisture: Vec<LogEntry> = Vec::new();
+
+    for entry in log.drain(..) {
+        let ts_secs = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+            .map(|t| t.timestamp())
+            .unwrap_or(0);
+        match &entry.message {
+            Message::Moisture { .. } if ts_secs >= raw_edge => recent.push(entry),
+            Message::Moisture { .. }                        => to_average.push(entry),
+            _                                               => non_moisture.push(entry),
+        }
+    }
+
+    // Accumulate hourly buckets: bucket_epoch -> (sum, count)
+    let mut hourly: std::collections::BTreeMap<i64, (u64, u32)> = std::collections::BTreeMap::new();
+    for entry in &to_average {
+        if let Message::Moisture { adc_raw } = &entry.message {
+            let ts = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+                .map(|t| t.timestamp())
+                .unwrap_or(0);
+            let bucket = ts / 3600 * 3600; // floor to hour
+            let acc = hourly.entry(bucket).or_insert((0, 0));
+            acc.0 += *adc_raw as u64;
+            acc.1 += 1;
+        }
+    }
+
+    // One averaged LogEntry per bucket
+    let mut averaged: Vec<LogEntry> = hourly
+        .into_iter()
+        .filter_map(|(bucket_ts, (sum, count))| {
+            let avg = (sum / count as u64) as u16;
+            let ts  = NaiveDateTime::from_timestamp_opt(bucket_ts, 0)
+                .map(|ndt| Local.from_utc_datetime(&ndt).to_rfc3339())?;
+            Some(LogEntry { timestamp: ts, message: Message::Moisture { adc_raw: avg } })
+        })
+        .collect();
+
+    log.append(&mut averaged);
+    log.append(&mut non_moisture);
+    log.append(&mut recent);
+    log.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+}
+
 // --- Dashboard API (HTTP) ---
 
 async fn serve_dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+async fn serve_yucca() -> impl axum::response::IntoResponse {
+    let bytes = include_bytes!("../yucca.png");
+    (
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        bytes.as_slice(),
+    )
 }
 
 async fn get_event_log(State(state): State<Arc<SharedState>>) -> Json<ApiData> {
@@ -128,6 +203,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(serve_dashboard))
+        .route("/yucca.png", get(serve_yucca))
         .route("/api/data", get(get_event_log))
         .route("/api/water", post(post_water_command))
         .with_state(state);
@@ -154,7 +230,6 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 .pill.offline { color: #993c1d; background: #faece7; border-color: #f5c4b3; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .cards-top    { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
-.cards-bottom { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 1.5rem; }
 .card { background: #ebebea; border-radius: 8px; padding: 1rem; }
 .card-label { font-size: 13px; color: #5f5e5a; margin-bottom: 6px; }
 .card-value { font-size: 24px; font-weight: 500; }
@@ -175,6 +250,30 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 .badge-pump { background: #e1f5ee; color: #0f6e56; }
 .log-msg { color: #1a1a18; }
 .empty { color: #888780; font-size: 13px; }
+.main-with-plant { display: flex; gap: 12px; align-items: stretch; margin-bottom: 1.5rem; }
+.plant-img { width: 110px; flex-shrink: 0; border-radius: 8px; object-fit: cover; object-position: center; }
+.cards-wrapper { flex: 1; min-width: 0; }
+.cards-bottom { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.section-legend { display: flex; gap: 14px; font-size: 11px; color: #888780; align-items: center; }
+.legend-item { display: flex; align-items: center; gap: 5px; }
+.legend-swatch { width: 20px; height: 2px; display: inline-block; }
+.legend-solid  { background: #639922; }
+.legend-dashed { background: repeating-linear-gradient(90deg,#639922 0 5px,transparent 5px 9px); }
+.legend-water  { background: repeating-linear-gradient(90deg,#3b7bbf 0 4px,transparent 4px 8px); }
+.slider-wrap { margin-top: 14px; }
+.slider-row { display: flex; align-items: center; gap: 10px; }
+.slider-row label { font-size: 12px; color: #5f5e5a; white-space: nowrap; }
+.slider-row input[type=range] { flex: 1; accent-color: #639922; cursor: pointer; }
+.slider-val { font-size: 12px; color: #5f5e5a; min-width: 30px; text-align: right; }
+.slider-ticks { display: flex; justify-content: space-between; font-size: 10px; color: #aaa; padding: 2px 2px 0; }
+.card-word { font-size: 12px; font-weight: 500; margin-top: 5px; }
+.word-waterlogged { color: #0d5c8c; }
+.word-soaked      { color: #1976a8; }
+.word-happy       { color: #2e7d32; }
+.word-thirsty     { color: #b07a00; }
+.word-dry         { color: #c0530a; }
+.word-parched     { color: #b71c1c; }
 </style>
 </head>
 <body>
@@ -183,34 +282,57 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
     <span class="title">Yucca palm</span>
     <span class="pill offline" id="pill"><span class="dot"></span><span id="pill-text">offline</span></span>
   </div>
-  <div class="cards-top">
-    <div class="card">
-      <div class="card-label">Moisture (ADC raw)</div>
-      <div class="card-value" id="c-moisture">—</div>
-      <div class="card-sub" id="c-moisture-sub">no data</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Last watered</div>
-      <div class="card-value" id="c-watered">—</div>
-      <div class="card-sub" id="c-watered-sub"></div>
-    </div>
-    <div class="card">
-      <div class="card-label">Readings (7 d)</div>
-      <div class="card-value" id="c-count">—</div>
-      <div class="card-sub">moisture reports</div>
-    </div>
-  </div>
-  <div class="cards-bottom">
-    <div class="btn-tile btn-water">
-      <button onclick="sendWater(22)">Water now (22 s)</button>
-    </div>
-    <div class="btn-tile btn-test">
-      <button onclick="sendWater(3)">Test pump (3 s)</button>
+  <div class="main-with-plant">
+    <img class="plant-img" src="/yucca.png" alt="Yucca palm">
+    <div class="cards-wrapper">
+      <div class="cards-top">
+        <div class="card">
+          <div class="card-label">Moisture (ADC raw)</div>
+          <div class="card-value" id="c-moisture">—</div>
+          <div class="card-sub" id="c-moisture-sub">no data</div>
+          <div class="card-word" id="c-moisture-word"></div>
+        </div>
+        <div class="card">
+          <div class="card-label">Last watered</div>
+          <div class="card-value" id="c-watered">—</div>
+          <div class="card-sub" id="c-watered-sub"></div>
+        </div>
+        <div class="card">
+          <div class="card-label">Readings (7 d)</div>
+          <div class="card-value" id="c-count">—</div>
+          <div class="card-sub">moisture reports</div>
+        </div>
+      </div>
+      <div class="cards-bottom">
+        <div class="btn-tile btn-water">
+          <button onclick="sendWater(22)">Water now (22 s)</button>
+        </div>
+        <div class="btn-tile btn-test">
+          <button onclick="sendWater(3)">Test pump (3 s)</button>
+        </div>
+      </div>
     </div>
   </div>
   <div class="section">
-    <div class="section-label">Moisture — last 7 days</div>
+    <div class="section-header">
+      <span class="section-label" id="graph-label">Moisture — last 7 days</span>
+      <div class="section-legend">
+        <span class="legend-item"><span class="legend-swatch legend-solid"></span>data</span>
+        <span class="legend-item"><span class="legend-swatch legend-dashed"></span>gap</span>
+        <span class="legend-item"><span class="legend-swatch legend-water"></span>watered</span>
+      </div>
+    </div>
     <canvas id="chart" height="160"></canvas>
+    <div class="slider-wrap">
+      <div class="slider-row">
+        <label for="day-slider">Days back</label>
+        <input type="range" id="day-slider" min="1" max="14" value="7" step="1">
+        <span class="slider-val" id="slider-val">7 d</span>
+      </div>
+      <div class="slider-ticks">
+        <span>1d</span><span>3d</span><span>7d</span><span>10d</span><span>14d</span>
+      </div>
+    </div>
   </div>
   <div class="section">
     <div class="section-label">Event log</div>
@@ -220,6 +342,15 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
 let chart = null;
+
+function moistureWord(adc) {
+  if (adc < 700)  return { word: 'waterlogged', cls: 'word-waterlogged' };
+  if (adc < 1400) return { word: 'soaked',      cls: 'word-soaked'      };
+  if (adc < 2600) return { word: 'happy',        cls: 'word-happy'       };
+  if (adc < 3100) return { word: 'thirsty',      cls: 'word-thirsty'     };
+  if (adc < 3600) return { word: 'dry',           cls: 'word-dry'         };
+  return                  { word: 'parched',      cls: 'word-parched'     };
+}
 
 function timeSince(iso) {
   const s = Math.floor((Date.now() - new Date(iso)) / 1000);
@@ -242,8 +373,13 @@ function updateCards(log) {
 
   if (moisture.length) {
     const last = moisture[moisture.length - 1];
-    document.getElementById('c-moisture').textContent = last.message.Moisture.adc_raw.toLocaleString('no-NO');
+    const adc = last.message.Moisture.adc_raw;
+    document.getElementById('c-moisture').textContent = adc.toLocaleString('no-NO');
     document.getElementById('c-moisture-sub').textContent = timeSince(last.timestamp);
+    const mw = moistureWord(adc);
+    const wordEl = document.getElementById('c-moisture-word');
+    wordEl.textContent = mw.word;
+    wordEl.className = 'card-word ' + mw.cls;
     const online = (Date.now() - new Date(last.timestamp)) < 2 * 3600e3;
     const pill = document.getElementById('pill');
     pill.className = 'pill ' + (online ? 'online' : 'offline');
@@ -257,29 +393,132 @@ function updateCards(log) {
   }
 }
 
-function renderChart(log) {
+// Gap threshold: two consecutive moisture points this far apart → draw a dashed connector
+const GAP_MS = 3 * 3600e3;
+
+// Custom plugin: blue dashed vertical lines at watering events
+const waterMarkerPlugin = {
+  id: 'waterMarkers',
+  afterDraw(ch, _args, opts) {
+    if (!opts.times || !opts.times.length) return;
+    const { ctx, scales: { x, y } } = ch;
+    ctx.save();
+    ctx.strokeStyle = '#3b7bbf';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    opts.times.forEach(t => {
+      if (t < x.min || t > x.max) return;
+      const px = x.getPixelForValue(t);
+      ctx.beginPath(); ctx.moveTo(px, y.top); ctx.lineTo(px, y.bottom); ctx.stroke();
+    });
+    ctx.restore();
+  }
+};
+
+let cachedLog = [];
+
+function buildDatasets(daysBack) {
   const now      = Date.now();
-  const sevenDaysAgo = now - 7 * 86400e3;
-  const pts = log.filter(e => e.message.Moisture && new Date(e.timestamp) > sevenDaysAgo).slice(-48);
-  const data = pts.map(e => ({ x: new Date(e.timestamp).getTime(), y: e.message.Moisture.adc_raw }));
-  const xMin = pts.length ? Math.max(new Date(pts[0].timestamp).getTime(), sevenDaysAgo) : sevenDaysAgo;
+  const viewStart = now - daysBack * 86400e3;
+  const pts = cachedLog
+    .filter(e => e.message.Moisture && new Date(e.timestamp).getTime() >= viewStart)
+    .map(e => ({ x: new Date(e.timestamp).getTime(), y: e.message.Moisture.adc_raw }))
+    .sort((a, b) => a.x - b.x);
+
+  // Split into continuous segments
+  const segs = [];
+  let seg = [];
+  for (let i = 0; i < pts.length; i++) {
+    if (i > 0 && pts[i].x - pts[i - 1].x > GAP_MS) { segs.push(seg); seg = []; }
+    seg.push(pts[i]);
+  }
+  if (seg.length) segs.push(seg);
+
+  // Solid datasets (one per segment; first gets the fill)
+  const datasets = segs.map((s, i) => ({
+    data: s, borderColor: '#639922',
+    backgroundColor: i === 0 ? 'rgba(99,153,34,0.07)' : 'rgba(0,0,0,0)',
+    borderWidth: 1.5, pointRadius: s.length < 30 ? 2 : 0,
+    pointBackgroundColor: '#639922', fill: i === 0 ? 'origin' : false,
+    tension: 0.3, spanGaps: false, order: 1,
+  }));
+
+  // Dashed gap connectors between segments
+  for (let i = 0; i + 1 < segs.length; i++) {
+    const a = segs[i][segs[i].length - 1];
+    const b = segs[i + 1][0];
+    datasets.push({
+      data: [a, b], borderColor: '#639922',
+      backgroundColor: 'rgba(0,0,0,0)', borderWidth: 1.5,
+      borderDash: [6, 5], pointRadius: 0, fill: false,
+      tension: 0, spanGaps: true, order: 2,
+    });
+  }
+
+  // Left-extension: horizontal dashed line from viewStart to first known point
+  if (pts.length > 0 && pts[0].x > viewStart + GAP_MS) {
+    datasets.push({
+      data: [{ x: viewStart, y: pts[0].y }, { x: pts[0].x, y: pts[0].y }],
+      borderColor: '#639922', backgroundColor: 'rgba(0,0,0,0)',
+      borderWidth: 1.5, borderDash: [6, 5], pointRadius: 0,
+      fill: false, tension: 0, spanGaps: true, order: 2,
+    });
+  }
+
+  return datasets;
+}
+
+function wateringTimes() {
+  return cachedLog
+    .filter(e => e.message.Pump)
+    .map(e => new Date(e.timestamp).getTime());
+}
+
+function renderChart(daysBack) {
+  const now      = Date.now();
+  const viewStart = now - daysBack * 86400e3;
+  const datasets  = buildDatasets(daysBack);
+  const wtimes    = wateringTimes();
 
   if (!chart) {
     chart = new Chart(document.getElementById('chart'), {
       type: 'line',
-      data: { datasets: [{ data, borderColor: '#639922', backgroundColor: 'rgba(99,153,34,0.08)', borderWidth: 1.5, pointRadius: 3, pointBackgroundColor: '#639922', fill: true, tension: 0.3 }] },
-      options: { responsive: true, parsing: false, plugins: { legend: { display: false } }, scales: {
-        x: { type: 'linear', min: xMin, max: now, ticks: { color: '#888780', font: { size: 11 }, maxTicksLimit: 7, callback: v => fmtTs(v) } },
-        y: { min: 0, max: 4095, ticks: { color: '#888780', font: { size: 11 } } }
-      }}
+      data: { datasets },
+      options: {
+        responsive: true, animation: false, parsing: false,
+        plugins: {
+          legend: { display: false },
+          waterMarkers: { times: wtimes },
+        },
+        scales: {
+          x: { type: 'linear', min: viewStart, max: now,
+               ticks: { color: '#888780', font: { size: 11 }, maxTicksLimit: 8,
+                        callback: v => fmtTs(v) },
+               grid: { color: '#f0ede4' } },
+          y: { min: 0, max: 4095,
+               ticks: { color: '#888780', font: { size: 11 } },
+               grid: { color: '#f0ede4' } },
+        },
+      },
+      plugins: [waterMarkerPlugin],
     });
   } else {
-    chart.data.datasets[0].data = data;
-    chart.options.scales.x.min = xMin;
+    chart.data.datasets = datasets;
+    chart.options.scales.x.min = viewStart;
     chart.options.scales.x.max = now;
+    chart.options.plugins.waterMarkers.times = wtimes;
     chart.update();
   }
 }
+
+let currentDays = 7;
+document.getElementById('day-slider').addEventListener('input', function() {
+  currentDays = parseInt(this.value, 10);
+  document.getElementById('slider-val').textContent = currentDays + ' d';
+  document.getElementById('graph-label').textContent =
+    'Moisture — last ' + currentDays + ' day' + (currentDays !== 1 ? 's' : '');
+  renderChart(currentDays);
+});
 
 function renderLog(log) {
   const el = document.getElementById('log');
@@ -301,8 +540,9 @@ async function loadData() {
   try {
     const r = await fetch('/api/data');
     const d = await r.json();
+    cachedLog = d.log;
     updateCards(d.log);
-    renderChart(d.log);
+    renderChart(currentDays);
     renderLog(d.log);
   } catch(e) { console.error(e); }
 }
@@ -312,7 +552,7 @@ async function sendWater(duration_s) {
 }
 
 loadData();
-setInterval(loadData, 60000);
+setInterval(loadData, 5000);
 </script>
 </body>
 </html>"#####;
