@@ -159,12 +159,12 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 .card-label { font-size: 13px; color: #5f5e5a; margin-bottom: 6px; }
 .card-value { font-size: 24px; font-weight: 500; }
 .card-sub { font-size: 12px; color: #888780; margin-top: 4px; }
-.card-buttons { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
-.btn { padding: 7px 12px; border-radius: 8px; font-size: 13px; cursor: pointer; border: 1px solid; width: 100%; }
-.btn-water { background: #e1f5ee; color: #0f6e56; border-color: #9fe1cb; }
-.btn-water:hover { background: #9fe1cb; }
-.btn-test  { background: #ebebea; color: #5f5e5a; border-color: #d3d1c7; }
-.btn-test:hover  { background: #d3d1c7; }
+.btn-tile { border-radius: 8px; overflow: hidden; }
+.btn-tile button { display: block; width: 100%; min-height: 72px; border: none; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; font-family: inherit; }
+.btn-water button { background: #e1f5ee; color: #27500a; }
+.btn-water button:hover { background: #9fe1cb; }
+.btn-test button  { background: #d3d1c7; color: #444441; border: none; }
+.btn-test button:hover  { background: #b4b2a9; }
 .section { background: white; border: 1px solid #e8e8e4; border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem; }
 .section-label { font-size: 13px; color: #5f5e5a; font-weight: 500; margin-bottom: 12px; }
 .log-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #f1efe8; font-size: 13px; }
@@ -175,7 +175,6 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 .badge-pump { background: #e1f5ee; color: #0f6e56; }
 .log-msg { color: #1a1a18; }
 .empty { color: #888780; font-size: 13px; }
-.cmd-note { font-size: 12px; color: #5f5e5a; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -202,19 +201,11 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
     </div>
   </div>
   <div class="cards-bottom">
-    <div class="card">
-      <div class="card-label">Watering</div>
-      <div class="card-buttons">
-        <button class="btn btn-water" onclick="sendWater(22)">Water now (22 s)</button>
-      </div>
-      <div class="cmd-note" id="water-note"></div>
+    <div class="btn-tile btn-water">
+      <button onclick="sendWater(22)">Water now (22 s)</button>
     </div>
-    <div class="card">
-      <div class="card-label">Test pump</div>
-      <div class="card-buttons">
-        <button class="btn btn-test" onclick="sendWater(3)">Test pump (3 s)</button>
-      </div>
-      <div class="cmd-note" id="test-note"></div>
+    <div class="btn-tile btn-test">
+      <button onclick="sendWater(3)">Test pump (3 s)</button>
     </div>
   </div>
   <div class="section">
@@ -317,13 +308,7 @@ async function loadData() {
 }
 
 async function sendWater(duration_s) {
-  const note = document.getElementById(duration_s === 22 ? 'water-note' : 'test-note');
-  note.textContent = 'sending…';
-  try {
-    const r = await fetch('/api/water', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({duration_s}) });
-    note.textContent = r.ok ? 'command sent' : 'no node connected';
-  } catch { note.textContent = 'error'; }
-  setTimeout(() => note.textContent = '', 3000);
+  await fetch('/api/water', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({duration_s}) });
 }
 
 loadData();
