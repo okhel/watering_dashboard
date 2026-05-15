@@ -7,63 +7,42 @@ use chrono::Local;
 use axum::{Router, routing::{get, post}, extract::State, Json};
 use axum::http::StatusCode;
 use axum::response::Html;
-use serde::{Serialize, Deserialize};
-
 mod config;
 mod types;
 use config::{BIND_ADDR, HTTP_ADDR, LIVENESS_SECS, MAX_EVENTS};
-use types::Message;
+use types::{ApiData, LogEntry, Message, WaterRequest};
 
-#[derive(Serialize, Clone)]
-struct Event {
-    timestamp: String, // RFC 3339 — JS can parse this directly
-    kind: String,
-    data: serde_json::Value,
+struct SharedState {
+    log:     Mutex<Vec<LogEntry>>,
+    node_tx: Mutex<Option<mpsc::Sender<u16>>>, // None when no node is connected
 }
 
-#[derive(Serialize)]
-struct ApiData {
-    events: Vec<Event>,
-    online: bool,
-}
+// --- Node communication (TCP) ---
 
-#[derive(Deserialize)]
-struct WaterRequest {
-    duration_s: u16,
-}
-
-struct AppState {
-    events:   Mutex<Vec<Event>>,
-    water_tx: Mutex<Option<mpsc::Sender<u16>>>, // None when no ESP32 connected
-}
-
-// --- TCP server ---
-
-fn tcp_server(state: Arc<AppState>) {
+fn node_listener(state: Arc<SharedState>) {
     let listener = TcpListener::bind(BIND_ADDR).expect("TCP bind failed");
     println!("TCP  listening on {BIND_ADDR}");
 
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if let Err(e) = handle_connection(s, &state) {
-                    eprintln!("connection closed: {e}");
+                if let Err(e) = node_session(s, &state) {
+                    eprintln!("node disconnected: {e}");
                 }
-                // Clear the water channel when the connection drops
-                *state.water_tx.lock().unwrap() = None;
+                *state.node_tx.lock().unwrap() = None;
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
     }
 }
 
-fn handle_connection(stream: TcpStream, state: &Arc<AppState>) -> std::io::Result<()> {
+fn node_session(stream: TcpStream, state: &Arc<SharedState>) -> std::io::Result<()> {
     let peer = stream.peer_addr()?;
     println!("[{}] connected: {peer}", Local::now().format("%H:%M:%S"));
 
-    // Create a per-connection water command channel
+    // Per-session channel for sending water commands to the node
     let (tx, rx) = mpsc::channel::<u16>();
-    *state.water_tx.lock().unwrap() = Some(tx);
+    *state.node_tx.lock().unwrap() = Some(tx);
 
     // Writer thread: sends water commands whenever they arrive
     let mut write_stream = stream.try_clone()?;
@@ -98,59 +77,38 @@ fn handle_connection(stream: TcpStream, state: &Arc<AppState>) -> std::io::Resul
 
         match serde_json::from_slice::<Message>(&payload) {
             Ok(msg) => {
-                let ts = Local::now().to_rfc3339();
                 println!("[{}] {msg:?}", Local::now().format("%H:%M:%S"));
-                let event = to_event(ts, &msg);
-                let mut events = state.events.lock().unwrap();
-                events.push(event);
-                if events.len() > MAX_EVENTS {
-                    events.remove(0);
-                }
+                let mut log = state.log.lock().unwrap();
+                log.push(LogEntry { timestamp: Local::now().to_rfc3339(), message: msg });
+                if log.len() > MAX_EVENTS { log.remove(0); }
             }
             Err(e) => eprintln!("decode error ({len} bytes): {e}"),
         }
     }
 }
 
-fn to_event(ts: String, msg: &Message) -> Event {
-    match msg {
-        Message::Moisture { adc_raw } => Event {
-            timestamp: ts, kind: "moisture".into(),
-            data: serde_json::json!({ "adc_raw": adc_raw }),
-        },
-        Message::Pump { duration_s } => Event {
-            timestamp: ts, kind: "pump".into(),
-            data: serde_json::json!({ "duration_s": duration_s }),
-        },
-        Message::Water { duration_s } => Event {
-            timestamp: ts, kind: "water".into(),
-            data: serde_json::json!({ "duration_s": duration_s }),
-        },
-    }
-}
+// --- Dashboard API (HTTP) ---
 
-// --- HTTP handlers ---
-
-async fn index() -> Html<&'static str> {
+async fn serve_dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
-async fn api_data(State(state): State<Arc<AppState>>) -> Json<ApiData> {
-    let events = state.events.lock().unwrap().clone();
-    let online = events.iter()
-        .filter(|e| e.kind == "moisture")
+async fn get_event_log(State(state): State<Arc<SharedState>>) -> Json<ApiData> {
+    let log = state.log.lock().unwrap().clone();
+    let online = log.iter()
+        .filter(|e| matches!(e.message, Message::Moisture { .. }))
         .last()
         .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.timestamp).ok())
         .map(|t| (chrono::Local::now() - t.with_timezone(&chrono::Local)).num_seconds().unsigned_abs() < LIVENESS_SECS)
         .unwrap_or(false);
-    Json(ApiData { events, online })
+    Json(ApiData { log, online })
 }
 
-async fn api_water(
-    State(state): State<Arc<AppState>>,
+async fn post_water_command(
+    State(state): State<Arc<SharedState>>,
     Json(body): Json<WaterRequest>,
 ) -> StatusCode {
-    match state.water_tx.lock().unwrap().as_ref() {
+    match state.node_tx.lock().unwrap().as_ref() {
         Some(tx) => { tx.send(body.duration_s).ok(); StatusCode::OK }
         None     => StatusCode::SERVICE_UNAVAILABLE,
     }
@@ -160,18 +118,18 @@ async fn api_water(
 
 #[tokio::main]
 async fn main() {
-    let state = Arc::new(AppState {
-        events:   Mutex::new(Vec::new()),
-        water_tx: Mutex::new(None),
+    let state = Arc::new(SharedState {
+        log:     Mutex::new(Vec::new()),
+        node_tx: Mutex::new(None),
     });
 
-    let state_tcp = Arc::clone(&state);
-    thread::spawn(move || tcp_server(state_tcp));
+    let state_node = Arc::clone(&state);
+    thread::spawn(move || node_listener(state_node));
 
     let app = Router::new()
-        .route("/", get(index))
-        .route("/api/data", get(api_data))
-        .route("/api/water", post(api_water))
+        .route("/", get(serve_dashboard))
+        .route("/api/data", get(get_event_log))
+        .route("/api/water", post(post_water_command))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(HTTP_ADDR).await.unwrap();
@@ -179,7 +137,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
+const DASHBOARD_HTML: &str = r#####"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -195,25 +153,29 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 .pill.online  { color: #0f6e56; background: #e1f5ee; border-color: #9fe1cb; }
 .pill.offline { color: #993c1d; background: #faece7; border-color: #f5c4b3; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 1.5rem; }
+.cards-top    { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.cards-bottom { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 1.5rem; }
 .card { background: #ebebea; border-radius: 8px; padding: 1rem; }
 .card-label { font-size: 13px; color: #5f5e5a; margin-bottom: 6px; }
 .card-value { font-size: 24px; font-weight: 500; }
 .card-sub { font-size: 12px; color: #888780; margin-top: 4px; }
+.card-buttons { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.btn { padding: 7px 12px; border-radius: 8px; font-size: 13px; cursor: pointer; border: 1px solid; width: 100%; }
+.btn-water { background: #e1f5ee; color: #0f6e56; border-color: #9fe1cb; }
+.btn-water:hover { background: #9fe1cb; }
+.btn-test  { background: #ebebea; color: #5f5e5a; border-color: #d3d1c7; }
+.btn-test:hover  { background: #d3d1c7; }
 .section { background: white; border: 1px solid #e8e8e4; border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem; }
 .section-label { font-size: 13px; color: #5f5e5a; font-weight: 500; margin-bottom: 12px; }
 .log-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #f1efe8; font-size: 13px; }
 .log-row:last-child { border-bottom: none; }
 .log-time { color: #888780; min-width: 130px; font-variant-numeric: tabular-nums; }
 .log-badge { font-size: 11px; padding: 2px 8px; border-radius: 6px; font-weight: 500; min-width: 64px; text-align: center; }
-.badge-moisture { background: #e6f1fb; color: #185fa5; }
+.badge-moisture { background: #eaf3de; color: #3b6d11; }
 .badge-pump { background: #e1f5ee; color: #0f6e56; }
 .log-msg { color: #1a1a18; }
-.actions { display: flex; gap: 12px; align-items: center; }
-.btn { padding: 8px 20px; border-radius: 8px; font-size: 14px; cursor: pointer; background: #e6f1fb; color: #185fa5; border: 1px solid #b5d4f4; }
-.btn:hover { background: #b5d4f4; }
 .empty { color: #888780; font-size: 13px; }
-.status-note { font-size: 13px; color: #5f5e5a; }
+.cmd-note { font-size: 12px; color: #5f5e5a; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -222,7 +184,7 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
     <span class="title">Yucca palm</span>
     <span class="pill offline" id="pill"><span class="dot"></span><span id="pill-text">offline</span></span>
   </div>
-  <div class="cards">
+  <div class="cards-top">
     <div class="card">
       <div class="card-label">Moisture (ADC raw)</div>
       <div class="card-value" id="c-moisture">—</div>
@@ -239,6 +201,22 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
       <div class="card-sub">moisture reports</div>
     </div>
   </div>
+  <div class="cards-bottom">
+    <div class="card">
+      <div class="card-label">Watering</div>
+      <div class="card-buttons">
+        <button class="btn btn-water" onclick="sendWater(22)">Water now (22 s)</button>
+      </div>
+      <div class="cmd-note" id="water-note"></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Test pump</div>
+      <div class="card-buttons">
+        <button class="btn btn-test" onclick="sendWater(3)">Test pump (3 s)</button>
+      </div>
+      <div class="cmd-note" id="test-note"></div>
+    </div>
+  </div>
   <div class="section">
     <div class="section-label">Moisture — last 7 days</div>
     <canvas id="chart" height="160"></canvas>
@@ -246,10 +224,6 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
   <div class="section">
     <div class="section-label">Event log</div>
     <div id="log"></div>
-  </div>
-  <div class="actions">
-    <button class="btn" onclick="sendWater()">Water now (22 s)</button>
-    <span class="status-note" id="water-note"></span>
   </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -264,20 +238,20 @@ function timeSince(iso) {
   return Math.floor(s / 86400) + ' d ago';
 }
 
-function fmtTs(iso) {
-  return new Date(iso).toLocaleString('no-NO', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+function fmtTs(ms) {
+  return new Date(ms).toLocaleString('no-NO', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function updateCards(events) {
-  const moisture = events.filter(e => e.kind === 'moisture');
-  const pumps    = events.filter(e => e.kind === 'pump');
+function updateCards(log) {
+  const moisture = log.filter(e => e.message.Moisture);
+  const pumps    = log.filter(e => e.message.Pump);
   const cutoff   = Date.now() - 7 * 86400e3;
 
   document.getElementById('c-count').textContent = moisture.filter(e => new Date(e.timestamp) > cutoff).length;
 
   if (moisture.length) {
     const last = moisture[moisture.length - 1];
-    document.getElementById('c-moisture').textContent = last.data.adc_raw.toLocaleString('no-NO');
+    document.getElementById('c-moisture').textContent = last.message.Moisture.adc_raw.toLocaleString('no-NO');
     document.getElementById('c-moisture-sub').textContent = timeSince(last.timestamp);
     const online = (Date.now() - new Date(last.timestamp)) < 2 * 3600e3;
     const pill = document.getElementById('pill');
@@ -288,42 +262,46 @@ function updateCards(events) {
   if (pumps.length) {
     const last = pumps[pumps.length - 1];
     document.getElementById('c-watered').textContent = timeSince(last.timestamp);
-    document.getElementById('c-watered-sub').textContent = last.data.duration_s + ' s';
+    document.getElementById('c-watered-sub').textContent = last.message.Pump.duration_s + ' s';
   }
 }
 
-function renderChart(events) {
-  const pts = events
-    .filter(e => e.kind === 'moisture' && new Date(e.timestamp) > Date.now() - 7 * 86400e3)
-    .slice(-48);
-  const labels = pts.map(e => fmtTs(e.timestamp));
-  const data   = pts.map(e => e.data.adc_raw);
+function renderChart(log) {
+  const now      = Date.now();
+  const sevenDaysAgo = now - 7 * 86400e3;
+  const pts = log.filter(e => e.message.Moisture && new Date(e.timestamp) > sevenDaysAgo).slice(-48);
+  const data = pts.map(e => ({ x: new Date(e.timestamp).getTime(), y: e.message.Moisture.adc_raw }));
+  const xMin = pts.length ? Math.max(new Date(pts[0].timestamp).getTime(), sevenDaysAgo) : sevenDaysAgo;
+
   if (!chart) {
     chart = new Chart(document.getElementById('chart'), {
       type: 'line',
-      data: { labels, datasets: [{ data, borderColor: '#378ADD', backgroundColor: 'rgba(55,138,221,0.08)', borderWidth: 1.5, pointRadius: 3, pointBackgroundColor: '#378ADD', fill: true, tension: 0.3 }] },
-      options: { responsive: true, plugins: { legend: { display: false } }, scales: {
-        x: { ticks: { color: '#888780', font: { size: 11 }, maxTicksLimit: 7 } },
+      data: { datasets: [{ data, borderColor: '#639922', backgroundColor: 'rgba(99,153,34,0.08)', borderWidth: 1.5, pointRadius: 3, pointBackgroundColor: '#639922', fill: true, tension: 0.3 }] },
+      options: { responsive: true, parsing: false, plugins: { legend: { display: false } }, scales: {
+        x: { type: 'linear', min: xMin, max: now, ticks: { color: '#888780', font: { size: 11 }, maxTicksLimit: 7, callback: v => fmtTs(v) } },
         y: { min: 0, max: 4095, ticks: { color: '#888780', font: { size: 11 } } }
       }}
     });
   } else {
-    chart.data.labels = labels;
     chart.data.datasets[0].data = data;
+    chart.options.scales.x.min = xMin;
+    chart.options.scales.x.max = now;
     chart.update();
   }
 }
 
-function renderLog(events) {
+function renderLog(log) {
   const el = document.getElementById('log');
-  if (!events.length) { el.innerHTML = '<span class="empty">No events yet.</span>'; return; }
-  el.innerHTML = [...events].reverse().slice(0, 50).map(e => {
-    const badge = e.kind === 'pump' ? 'badge-pump' : 'badge-moisture';
-    const msg   = e.kind === 'moisture'
-      ? 'adc_raw ' + e.data.adc_raw.toLocaleString('no-NO')
-      : 'ran ' + e.data.duration_s + ' s';
-    return '<div class="log-row"><span class="log-time">' + fmtTs(e.timestamp) + '</span>'
-      + '<span class="log-badge ' + badge + '">' + e.kind + '</span>'
+  if (!log.length) { el.innerHTML = '<span class="empty">No events yet.</span>'; return; }
+  el.innerHTML = [...log].reverse().slice(0, 50).map(e => {
+    const isMoisture = !!e.message.Moisture;
+    const badge = isMoisture ? 'badge-moisture' : 'badge-pump';
+    const kind  = isMoisture ? 'moisture' : 'pump';
+    const msg   = isMoisture
+      ? 'adc_raw ' + e.message.Moisture.adc_raw.toLocaleString('no-NO')
+      : 'ran ' + e.message.Pump.duration_s + ' s';
+    return '<div class="log-row"><span class="log-time">' + fmtTs(new Date(e.timestamp).getTime()) + '</span>'
+      + '<span class="log-badge ' + badge + '">' + kind + '</span>'
       + '<span class="log-msg">' + msg + '</span></div>';
   }).join('');
 }
@@ -332,18 +310,18 @@ async function loadData() {
   try {
     const r = await fetch('/api/data');
     const d = await r.json();
-    updateCards(d.events);
-    renderChart(d.events);
-    renderLog(d.events);
+    updateCards(d.log);
+    renderChart(d.log);
+    renderLog(d.log);
   } catch(e) { console.error(e); }
 }
 
-async function sendWater() {
-  const note = document.getElementById('water-note');
+async function sendWater(duration_s) {
+  const note = document.getElementById(duration_s === 22 ? 'water-note' : 'test-note');
   note.textContent = 'sending…';
   try {
-    const r = await fetch('/api/water', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({duration_s: 22}) });
-    note.textContent = r.ok ? 'command sent' : 'no ESP32 connected';
+    const r = await fetch('/api/water', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({duration_s}) });
+    note.textContent = r.ok ? 'command sent' : 'no node connected';
   } catch { note.textContent = 'error'; }
   setTimeout(() => note.textContent = '', 3000);
 }
@@ -352,4 +330,4 @@ loadData();
 setInterval(loadData, 60000);
 </script>
 </body>
-</html>"####;
+</html>"#####;
