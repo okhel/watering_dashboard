@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Which sensor the moisture reading came from.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum Depth { Shallow, Deep }
+
 /// Messages sent from the ESP32 to the server.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
-    Moisture { adc_raw: u16 },
+    Moisture { adc_raw: u16, depth: Depth },
     Pump { duration_s: u16 },
     /// Host-issued command — echoed back by the ESP32 after execution.
     Water { duration_s: u16 },

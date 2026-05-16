@@ -9,12 +9,13 @@ use axum::http::StatusCode;
 use axum::response::Html;
 mod config;
 mod types;
-use config::{BIND_ADDR, HTTP_ADDR, LIVENESS_SECS, RAW_WINDOW_SECS, RETAIN_SECS};
-use types::{ApiData, LogEntry, Message, WaterRequest};
+use config::{AUTO_WATER_DURATION_S, AUTO_WATER_INTERVAL_SECS, BIND_ADDR, CSV_PATH, HTTP_ADDR, LIVENESS_SECS, RAW_WINDOW_SECS, RETAIN_SECS};
+use types::{ApiData, Depth, LogEntry, Message, WaterRequest};
 
 struct SharedState {
-    log:     Mutex<Vec<LogEntry>>,
-    node_tx: Mutex<Option<mpsc::Sender<u16>>>, // None when no node is connected
+    log:             Mutex<Vec<LogEntry>>,
+    node_tx:         Mutex<Option<mpsc::Sender<u16>>>,
+    written_buckets: Mutex<std::collections::HashSet<(i64, bool)>>,
 }
 
 // --- Node communication (TCP) ---
@@ -78,9 +79,18 @@ fn node_session(stream: TcpStream, state: &Arc<SharedState>) -> std::io::Result<
         match serde_json::from_slice::<Message>(&payload) {
             Ok(msg) => {
                 println!("[{}] {msg:?}", Local::now().format("%H:%M:%S"));
-                let mut log = state.log.lock().unwrap();
-                log.push(LogEntry { timestamp: Local::now().to_rfc3339(), message: msg });
-                compact_log(&mut log);
+                let entry = LogEntry { timestamp: Local::now().to_rfc3339(), message: msg };
+                // Pump events are sparse — flush immediately to CSV
+                if matches!(entry.message, Message::Pump { .. }) {
+                    append_csv_rows(&[entry.clone()]);
+                }
+                let sealed = {
+                    let mut log     = state.log.lock().unwrap();
+                    let mut written = state.written_buckets.lock().unwrap();
+                    log.push(entry);
+                    compact_log(&mut log, &mut written)
+                };
+                if !sealed.is_empty() { append_csv_rows(&sealed); }
             }
             Err(e) => eprintln!("decode error ({len} bytes): {e}"),
         }
@@ -95,10 +105,17 @@ fn node_session(stream: TcpStream, state: &Arc<SharedState>) -> std::io::Result<
 //   • moisture readings older than that collapsed to one average per hour
 //   • nothing older than RETAIN_SECS
 
-fn compact_log(log: &mut Vec<LogEntry>) {
+// Returns newly sealed hourly entries that should be appended to CSV.
+// A bucket is "sealed" once its end (bucket_ts + 3600) is older than the raw window,
+// meaning no further raw readings can still belong to it.
+fn compact_log(
+    log: &mut Vec<LogEntry>,
+    written: &mut std::collections::HashSet<(i64, bool)>,
+) -> Vec<LogEntry> {
     let now_secs  = Local::now().timestamp();
     let cutoff    = now_secs - RETAIN_SECS;
     let raw_edge  = now_secs - RAW_WINDOW_SECS;
+    let seal_edge = raw_edge - 3600; // bucket fully outside raw window
 
     // Drop everything beyond the retention window
     log.retain(|e| {
@@ -123,35 +140,158 @@ fn compact_log(log: &mut Vec<LogEntry>) {
         }
     }
 
-    // Accumulate hourly buckets: bucket_epoch -> (sum, count)
-    let mut hourly: std::collections::BTreeMap<i64, (u64, u32)> = std::collections::BTreeMap::new();
+    // Accumulate hourly buckets: (bucket_epoch, is_deep) -> (sum, count)
+    let mut hourly: std::collections::BTreeMap<(i64, bool), (u64, u32)> = std::collections::BTreeMap::new();
     for entry in &to_average {
-        if let Message::Moisture { adc_raw } = &entry.message {
+        if let Message::Moisture { adc_raw, depth } = &entry.message {
             let ts = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
                 .map(|t| t.timestamp())
                 .unwrap_or(0);
             let bucket = ts / 3600 * 3600; // floor to hour
-            let acc = hourly.entry(bucket).or_insert((0, 0));
+            let acc = hourly.entry((bucket, *depth == Depth::Deep)).or_insert((0, 0));
             acc.0 += *adc_raw as u64;
             acc.1 += 1;
         }
     }
 
-    // One averaged LogEntry per bucket
+    // One averaged LogEntry per (bucket, depth)
     let mut averaged: Vec<LogEntry> = hourly
         .into_iter()
-        .filter_map(|(bucket_ts, (sum, count))| {
-            let avg = (sum / count as u64) as u16;
-            let ts  = NaiveDateTime::from_timestamp_opt(bucket_ts, 0)
+        .filter_map(|((bucket_ts, is_deep), (sum, count))| {
+            let avg   = (sum / count as u64) as u16;
+            let depth = if is_deep { Depth::Deep } else { Depth::Shallow };
+            let ts    = NaiveDateTime::from_timestamp_opt(bucket_ts, 0)
                 .map(|ndt| Local.from_utc_datetime(&ndt).to_rfc3339())?;
-            Some(LogEntry { timestamp: ts, message: Message::Moisture { adc_raw: avg } })
+            Some(LogEntry { timestamp: ts, message: Message::Moisture { adc_raw: avg, depth } })
         })
         .collect();
+
+    // Collect newly sealed buckets to hand back for CSV writing
+    let mut to_csv: Vec<LogEntry> = Vec::new();
+    for entry in &averaged {
+        if let Message::Moisture { depth, .. } = &entry.message {
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
+                let key = (t.timestamp(), *depth == Depth::Deep);
+                if t.timestamp() < seal_edge && written.insert(key) {
+                    to_csv.push(entry.clone());
+                }
+            }
+        }
+    }
 
     log.append(&mut averaged);
     log.append(&mut non_moisture);
     log.append(&mut recent);
     log.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    to_csv
+}
+
+// --- Auto-watering ---
+//
+// Checks every minute. Reference time = last Pump event in the log,
+// or server start time if no watering has ever been recorded.
+// Sends a water command via node_tx when the interval elapses.
+
+fn auto_water_checker(state: Arc<SharedState>) {
+    let start_time = Local::now().timestamp();
+    loop {
+        thread::sleep(Duration::from_secs(60));
+
+        let reference = {
+            let log = state.log.lock().unwrap();
+            log.iter()
+                .filter(|e| matches!(e.message, Message::Pump { .. }))
+                .last()
+                .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.timestamp).ok())
+                .map(|t| t.timestamp())
+                .unwrap_or(start_time)
+        };
+
+        let elapsed = Local::now().timestamp() - reference;
+        if elapsed >= AUTO_WATER_INTERVAL_SECS {
+            let tx = state.node_tx.lock().unwrap();
+            if let Some(tx) = tx.as_ref() {
+                tx.send(AUTO_WATER_DURATION_S).ok();
+                println!("[{}] Auto-water sent ({} days since last)",
+                    Local::now().format("%H:%M:%S"), elapsed / 86400);
+            }
+        }
+    }
+}
+
+// --- CSV persistence ---
+
+fn load_csv() -> (Vec<LogEntry>, std::collections::HashSet<(i64, bool)>) {
+    use std::io::BufRead;
+    let mut entries: Vec<LogEntry> = Vec::new();
+    let mut written: std::collections::HashSet<(i64, bool)> = std::collections::HashSet::new();
+
+    let Ok(file) = std::fs::File::open(CSV_PATH) else {
+        return (entries, written); // first run — no file yet
+    };
+
+    for line in std::io::BufReader::new(file).lines().skip(1) {
+        let Ok(line) = line else { continue };
+        let parts: Vec<&str> = line.splitn(5, ',').collect();
+        if parts.len() < 5 { continue }
+
+        let timestamp = parts[0].to_string();
+        let msg = match parts[1] {
+            "moisture" => {
+                let Ok(adc_raw) = parts[2].parse::<u16>() else { continue };
+                let depth = if parts[3] == "Deep" { Depth::Deep } else { Depth::Shallow };
+                if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&timestamp) {
+                    written.insert((t.timestamp(), depth == Depth::Deep));
+                }
+                Message::Moisture { adc_raw, depth }
+            }
+            "pump" => {
+                let Ok(dur) = parts[4].parse::<u16>() else { continue };
+                Message::Pump { duration_s: dur }
+            }
+            _ => continue,
+        };
+        entries.push(LogEntry { timestamp, message: msg });
+    }
+
+    println!("CSV: loaded {} total entries", entries.len());
+
+    // Only keep the retention window in memory; the CSV holds everything
+    let cutoff = Local::now().timestamp() - RETAIN_SECS;
+    entries.retain(|e| {
+        chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+            .map(|t| t.timestamp() > cutoff)
+            .unwrap_or(false)
+    });
+
+    (entries, written)
+}
+
+fn append_csv_rows(entries: &[LogEntry]) {
+    use std::io::Write as _;
+    let needs_header = !std::path::Path::new(CSV_PATH).exists();
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true).append(true).open(CSV_PATH)
+    else {
+        eprintln!("CSV: could not open {CSV_PATH} for writing");
+        return;
+    };
+    if needs_header {
+        let _ = writeln!(file, "timestamp,kind,adc_raw,depth,duration_s");
+    }
+    for entry in entries {
+        let line = match &entry.message {
+            Message::Moisture { adc_raw, depth } =>
+                format!("{},moisture,{},{},",
+                    entry.timestamp, adc_raw,
+                    if *depth == Depth::Deep { "Deep" } else { "Shallow" }),
+            Message::Pump { duration_s } =>
+                format!("{},pump,,,{}", entry.timestamp, duration_s),
+            Message::Water { .. } => continue, // echo — not worth storing
+        };
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 // --- Dashboard API (HTTP) ---
@@ -193,13 +333,17 @@ async fn post_water_command(
 
 #[tokio::main]
 async fn main() {
+    let (initial_log, initial_written) = load_csv();
     let state = Arc::new(SharedState {
-        log:     Mutex::new(Vec::new()),
-        node_tx: Mutex::new(None),
+        log:             Mutex::new(initial_log),
+        node_tx:         Mutex::new(None),
+        written_buckets: Mutex::new(initial_written),
     });
 
-    let state_node = Arc::clone(&state);
+    let state_node  = Arc::clone(&state);
+    let state_water = Arc::clone(&state);
     thread::spawn(move || node_listener(state_node));
+    thread::spawn(move || auto_water_checker(state_water));
 
     let app = Router::new()
         .route("/", get(serve_dashboard))
@@ -258,9 +402,11 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 .section-legend { display: flex; gap: 14px; font-size: 11px; color: #888780; align-items: center; }
 .legend-item { display: flex; align-items: center; gap: 5px; }
 .legend-swatch { width: 20px; height: 2px; display: inline-block; }
-.legend-solid  { background: #639922; }
-.legend-dashed { background: repeating-linear-gradient(90deg,#639922 0 5px,transparent 5px 9px); }
-.legend-water  { background: repeating-linear-gradient(90deg,#3b7bbf 0 4px,transparent 4px 8px); }
+.legend-solid   { background: #639922; }
+.legend-shallow { background: #639922; }
+.legend-deep    { background: #2d5c0e; }
+.legend-dashed  { background: repeating-linear-gradient(90deg,#639922 0 5px,transparent 5px 9px); }
+.legend-water   { background: repeating-linear-gradient(90deg,#3b7bbf 0 4px,transparent 4px 8px); }
 .slider-wrap { margin-top: 14px; }
 .slider-row { display: flex; align-items: center; gap: 10px; }
 .slider-row label { font-size: 12px; color: #5f5e5a; white-space: nowrap; }
@@ -317,7 +463,8 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
     <div class="section-header">
       <span class="section-label" id="graph-label">Moisture — last 7 days</span>
       <div class="section-legend">
-        <span class="legend-item"><span class="legend-swatch legend-solid"></span>data</span>
+        <span class="legend-item"><span class="legend-swatch legend-shallow"></span>shallow</span>
+        <span class="legend-item"><span class="legend-swatch legend-deep"></span>deep</span>
         <span class="legend-item"><span class="legend-swatch legend-dashed"></span>gap</span>
         <span class="legend-item"><span class="legend-swatch legend-water"></span>watered</span>
       </div>
@@ -393,8 +540,40 @@ function updateCards(log) {
   }
 }
 
-// Gap threshold: two consecutive moisture points this far apart → draw a dashed connector
-const GAP_MS = 3 * 3600e3;
+const GAP_MS        = 3 * 3600e3;
+const COLOR_SHALLOW = '#639922';
+const COLOR_DEEP    = '#2d5c0e';
+
+// Builds solid segment datasets + dashed gap connectors for one depth series.
+// fillColor: CSS colour string for the area fill, or null for no fill.
+// Returns { ds, firstPt } where firstPt is used for the left-extension.
+function buildSeriesDatasets(pts, color, fillColor) {
+  const segs = [];
+  let seg = [];
+  for (let i = 0; i < pts.length; i++) {
+    if (i > 0 && pts[i].x - pts[i - 1].x > GAP_MS) { segs.push(seg); seg = []; }
+    seg.push(pts[i]);
+  }
+  if (seg.length) segs.push(seg);
+
+  const ds = segs.map((s, i) => ({
+    data: s, borderColor: color,
+    backgroundColor: (fillColor && i === 0) ? fillColor : 'rgba(0,0,0,0)',
+    borderWidth: 1.5, pointRadius: s.length < 30 ? 2 : 0,
+    pointBackgroundColor: color,
+    fill: (fillColor && i === 0) ? 'origin' : false,
+    tension: 0.3, spanGaps: false, order: 1,
+  }));
+
+  for (let i = 0; i + 1 < segs.length; i++) {
+    const a = segs[i][segs[i].length - 1], b = segs[i + 1][0];
+    ds.push({ data: [a, b], borderColor: color, backgroundColor: 'rgba(0,0,0,0)',
+      borderWidth: 1.5, borderDash: [6, 5], pointRadius: 0,
+      fill: false, tension: 0, spanGaps: true, order: 2 });
+  }
+
+  return { ds, firstPt: pts.length ? pts[0] : null };
+}
 
 // Custom plugin: blue dashed vertical lines at watering events
 const waterMarkerPlugin = {
@@ -418,51 +597,38 @@ const waterMarkerPlugin = {
 let cachedLog = [];
 
 function buildDatasets(daysBack) {
-  const now      = Date.now();
+  const now       = Date.now();
   const viewStart = now - daysBack * 86400e3;
-  const pts = cachedLog
-    .filter(e => e.message.Moisture && new Date(e.timestamp).getTime() >= viewStart)
-    .map(e => ({ x: new Date(e.timestamp).getTime(), y: e.message.Moisture.adc_raw }))
-    .sort((a, b) => a.x - b.x);
 
-  // Split into continuous segments
-  const segs = [];
-  let seg = [];
-  for (let i = 0; i < pts.length; i++) {
-    if (i > 0 && pts[i].x - pts[i - 1].x > GAP_MS) { segs.push(seg); seg = []; }
-    seg.push(pts[i]);
-  }
-  if (seg.length) segs.push(seg);
-
-  // Solid datasets (one per segment; first gets the fill)
-  const datasets = segs.map((s, i) => ({
-    data: s, borderColor: '#639922',
-    backgroundColor: i === 0 ? 'rgba(99,153,34,0.07)' : 'rgba(0,0,0,0)',
-    borderWidth: 1.5, pointRadius: s.length < 30 ? 2 : 0,
-    pointBackgroundColor: '#639922', fill: i === 0 ? 'origin' : false,
-    tension: 0.3, spanGaps: false, order: 1,
-  }));
-
-  // Dashed gap connectors between segments
-  for (let i = 0; i + 1 < segs.length; i++) {
-    const a = segs[i][segs[i].length - 1];
-    const b = segs[i + 1][0];
-    datasets.push({
-      data: [a, b], borderColor: '#639922',
-      backgroundColor: 'rgba(0,0,0,0)', borderWidth: 1.5,
-      borderDash: [6, 5], pointRadius: 0, fill: false,
-      tension: 0, spanGaps: true, order: 2,
-    });
+  function getPts(depthStr) {
+    return cachedLog
+      .filter(e => e.message.Moisture
+        && (e.message.Moisture.depth ?? 'Shallow') === depthStr
+        && new Date(e.timestamp).getTime() >= viewStart)
+      .map(e => ({ x: new Date(e.timestamp).getTime(), y: e.message.Moisture.adc_raw }))
+      .sort((a, b) => a.x - b.x);
   }
 
-  // Left-extension: horizontal dashed line from viewStart to first known point
-  if (pts.length > 0 && pts[0].x > viewStart + GAP_MS) {
-    datasets.push({
-      data: [{ x: viewStart, y: pts[0].y }, { x: pts[0].x, y: pts[0].y }],
-      borderColor: '#639922', backgroundColor: 'rgba(0,0,0,0)',
-      borderWidth: 1.5, borderDash: [6, 5], pointRadius: 0,
-      fill: false, tension: 0, spanGaps: true, order: 2,
-    });
+  const shallowPts = getPts('Shallow');
+  const deepPts    = getPts('Deep');
+
+  const { ds: shallowDs, firstPt: shallowFirst } =
+    buildSeriesDatasets(shallowPts, COLOR_SHALLOW, 'rgba(99,153,34,0.07)');
+  const { ds: deepDs, firstPt: deepFirst } =
+    buildSeriesDatasets(deepPts, COLOR_DEEP, null);
+
+  const datasets = [...shallowDs, ...deepDs];
+
+  // Left-extensions
+  for (const [firstPt, color] of [[shallowFirst, COLOR_SHALLOW], [deepFirst, COLOR_DEEP]]) {
+    if (firstPt && firstPt.x > viewStart + GAP_MS) {
+      datasets.push({
+        data: [{ x: viewStart, y: firstPt.y }, firstPt],
+        borderColor: color, backgroundColor: 'rgba(0,0,0,0)',
+        borderWidth: 1.5, borderDash: [6, 5], pointRadius: 0,
+        fill: false, tension: 0, spanGaps: true, order: 2,
+      });
+    }
   }
 
   return datasets;
