@@ -28,8 +28,8 @@ pub const MONSTERA: PlantConfig = PlantConfig {
     http_addr:                "0.0.0.0:8081",
     csv_path:                 "monstera_log.csv",
     image_path:               "monstera.png",
-    auto_water_interval_secs: 14 * 24 * 3600, // 2 weeks — tune for monstera
-    auto_water_duration_s:    22,             //          — tune for monstera
+    auto_water_interval_secs: 10 * 24 * 3600, // 10 days — slightly more frequent than yucca
+    auto_water_duration_s:    22,             // same pot, same fill
 };
 
 /// Selects the plant config based on a single CLI flag: `--yucca` or `--monstera`.
@@ -45,6 +45,8 @@ pub fn from_args() -> &'static PlantConfig {
 }
 
 // Shared constants — same for every plant.
-pub const LIVENESS_SECS: u64 = 2 * 60 * 60;   // 2 h  — beyond this the node is "offline"
+// Liveness threshold: also used as the TCP read_timeout on the server socket so a
+// stalled session is torn down at the same moment the UI flips to "offline".
+pub const LIVENESS_SECS: u64 = 10 * 60;         // 10 min — node sends every ~60 s
 pub const RAW_WINDOW_SECS: i64 = 30 * 60;       // 30 min of raw readings kept verbatim
 pub const RETAIN_SECS: i64 = 14 * 24 * 3600;    // 14 days total in-memory retention

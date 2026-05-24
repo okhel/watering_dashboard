@@ -17,6 +17,7 @@ struct SharedState {
     node_tx:         Mutex<Option<mpsc::Sender<u16>>>,
     written_buckets: Mutex<std::collections::HashSet<(i64, bool)>>,
     plant:           &'static PlantConfig,
+    start_time:      i64,  // server boot, used as fallback "last watered" for auto-water
 }
 
 // --- Node communication (TCP) ---
@@ -42,6 +43,10 @@ fn node_listener(state: Arc<SharedState>) {
 fn node_session(stream: TcpStream, state: &Arc<SharedState>) -> std::io::Result<()> {
     let peer = stream.peer_addr()?;
     println!("[{}] connected: {peer}", Local::now().format("%H:%M:%S"));
+
+    // No message within LIVENESS_SECS => read times out => session torn down.
+    // Same threshold also flips the UI pill — single source of truth.
+    stream.set_read_timeout(Some(Duration::from_secs(LIVENESS_SECS)))?;
 
     // Per-session channel for sending water commands to the node
     let (tx, rx) = mpsc::channel::<u16>();
@@ -195,20 +200,24 @@ fn compact_log(
 // or server start time if no watering has ever been recorded.
 // Sends a water command via node_tx when the interval elapses.
 
+/// Returns the unix-timestamp (seconds) of the last pump event, or server
+/// start time as fallback. Shared by auto-water and the dashboard API so
+/// the displayed countdown matches the actual trigger.
+fn last_water_reference(state: &SharedState) -> i64 {
+    let log = state.log.lock().unwrap();
+    log.iter()
+        .filter(|e| matches!(e.message, Message::Pump { .. }))
+        .last()
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.timestamp).ok())
+        .map(|t| t.timestamp())
+        .unwrap_or(state.start_time)
+}
+
 fn auto_water_checker(state: Arc<SharedState>) {
-    let start_time = Local::now().timestamp();
     loop {
         thread::sleep(Duration::from_secs(60));
 
-        let reference = {
-            let log = state.log.lock().unwrap();
-            log.iter()
-                .filter(|e| matches!(e.message, Message::Pump { .. }))
-                .last()
-                .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.timestamp).ok())
-                .map(|t| t.timestamp())
-                .unwrap_or(start_time)
-        };
+        let reference = last_water_reference(&state);
 
         let elapsed = Local::now().timestamp() - reference;
         if elapsed >= state.plant.auto_water_interval_secs {
@@ -317,6 +326,11 @@ async fn serve_plant_image(State(state): State<Arc<SharedState>>) -> impl axum::
 }
 
 async fn get_event_log(State(state): State<Arc<SharedState>>) -> Json<ApiData> {
+    let next_ts = last_water_reference(&state) + state.plant.auto_water_interval_secs;
+    let next_water_at = NaiveDateTime::from_timestamp_opt(next_ts, 0)
+        .map(|ndt| Local.from_utc_datetime(&ndt).to_rfc3339())
+        .unwrap_or_default();
+
     let log = state.log.lock().unwrap().clone();
     let online = log.iter()
         .filter(|e| matches!(e.message, Message::Moisture { .. }))
@@ -324,7 +338,7 @@ async fn get_event_log(State(state): State<Arc<SharedState>>) -> Json<ApiData> {
         .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.timestamp).ok())
         .map(|t| (chrono::Local::now() - t.with_timezone(&chrono::Local)).num_seconds().unsigned_abs() < LIVENESS_SECS)
         .unwrap_or(false);
-    Json(ApiData { log, online })
+    Json(ApiData { log, online, next_water_at })
 }
 
 async fn post_water_command(
@@ -348,6 +362,7 @@ async fn main() {
         node_tx:         Mutex::new(None),
         written_buckets: Mutex::new(initial_written),
         plant,
+        start_time:      Local::now().timestamp(),
     });
 
     let state_node  = Arc::clone(&state);
@@ -406,7 +421,7 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 .log-msg { color: #1a1a18; }
 .empty { color: #888780; font-size: 13px; }
 .main-with-plant { display: flex; gap: 12px; align-items: stretch; margin-bottom: 1.5rem; }
-.plant-img { width: 110px; flex-shrink: 0; border-radius: 8px; object-fit: cover; object-position: center; }
+.plant-img { width: 150px; flex-shrink: 0; border-radius: 8px; object-fit: cover; object-position: center; }
 .cards-wrapper { flex: 1; min-width: 0; }
 .cards-bottom { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -455,9 +470,9 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
           <div class="card-sub" id="c-watered-sub"></div>
         </div>
         <div class="card">
-          <div class="card-label">Readings (7 d)</div>
-          <div class="card-value" id="c-count">—</div>
-          <div class="card-sub">moisture reports</div>
+          <div class="card-label">Next watering</div>
+          <div class="card-value" id="c-next">—</div>
+          <div class="card-sub" id="c-next-sub"></div>
         </div>
       </div>
       <div class="cards-bottom">
@@ -518,16 +533,24 @@ function timeSince(iso) {
   return Math.floor(s / 86400) + ' d ago';
 }
 
+function timeUntil(iso) {
+  const s = Math.floor((new Date(iso) - Date.now()) / 1000);
+  if (s <= 0)       return { main: 'due now',           sub: s < -3600 ? 'overdue ' + Math.floor(-s/3600) + ' h' : '' };
+  if (s < 3600)     return { main: 'in ' + Math.ceil(s / 60) + ' min',   sub: '' };
+  if (s < 86400)    return { main: 'in ' + Math.floor(s / 3600) + ' h',  sub: '' };
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  return { main: 'in ' + d + ' d' + (h ? ' ' + h + ' h' : ''), sub: '' };
+}
+
 function fmtTs(ms) {
   return new Date(ms).toLocaleString('no-NO', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function updateCards(log) {
+function updateCards(data) {
+  const log      = data.log;
   const moisture = log.filter(e => e.message.Moisture);
   const pumps    = log.filter(e => e.message.Pump);
-  const cutoff   = Date.now() - 7 * 86400e3;
-
-  document.getElementById('c-count').textContent = moisture.filter(e => new Date(e.timestamp) > cutoff).length;
 
   if (moisture.length) {
     const last = moisture[moisture.length - 1];
@@ -538,22 +561,49 @@ function updateCards(log) {
     const wordEl = document.getElementById('c-moisture-word');
     wordEl.textContent = mw.word;
     wordEl.className = 'card-word ' + mw.cls;
-    const online = (Date.now() - new Date(last.timestamp)) < 2 * 3600e3;
-    const pill = document.getElementById('pill');
-    pill.className = 'pill ' + (online ? 'online' : 'offline');
-    document.getElementById('pill-text').textContent = online ? 'online' : 'offline';
   }
+
+  // Online pill — server is the source of truth.
+  const pill = document.getElementById('pill');
+  pill.className = 'pill ' + (data.online ? 'online' : 'offline');
+  document.getElementById('pill-text').textContent = data.online ? 'online' : 'offline';
 
   if (pumps.length) {
     const last = pumps[pumps.length - 1];
     document.getElementById('c-watered').textContent = timeSince(last.timestamp);
     document.getElementById('c-watered-sub').textContent = last.message.Pump.duration_s + ' s';
   }
+
+  if (data.next_water_at) {
+    const tu = timeUntil(data.next_water_at);
+    document.getElementById('c-next').textContent = tu.main;
+    document.getElementById('c-next-sub').textContent = tu.sub || fmtTs(new Date(data.next_water_at).getTime());
+  }
 }
 
 const GAP_MS        = 3 * 3600e3;
 const COLOR_SHALLOW = '#639922';
 const COLOR_DEEP    = '#2d5c0e';
+const SMOOTH_WIN    = 5;  // centered moving-average window (samples)
+
+// Centered moving average — phase-symmetric, no lag. Endpoints are
+// preserved (window shrinks near the edges) so the curve still reaches
+// the first/last sample positions.
+function smooth(pts, win) {
+  if (pts.length < 3 || win < 3) return pts;
+  const half = Math.floor(win / 2);
+  const out = new Array(pts.length);
+  for (let i = 0; i < pts.length; i++) {
+    let sum = 0, n = 0;
+    for (let k = -half; k <= half; k++) {
+      const j = i + k;
+      if (j < 0 || j >= pts.length) continue;
+      sum += pts[j].y; n++;
+    }
+    out[i] = { x: pts[i].x, y: sum / n };
+  }
+  return out;
+}
 
 // Builds solid segment datasets + dashed gap connectors for one depth series.
 // fillColor: CSS colour string for the area fill, or null for no fill.
@@ -567,17 +617,20 @@ function buildSeriesDatasets(pts, color, fillColor) {
   }
   if (seg.length) segs.push(seg);
 
-  const ds = segs.map((s, i) => ({
+  // Smooth each segment independently so MA doesn't bridge across gaps.
+  const smoothedSegs = segs.map(s => smooth(s, SMOOTH_WIN));
+
+  const ds = smoothedSegs.map((s, i) => ({
     data: s, borderColor: color,
     backgroundColor: (fillColor && i === 0) ? fillColor : 'rgba(0,0,0,0)',
     borderWidth: 1.5, pointRadius: s.length < 30 ? 2 : 0,
     pointBackgroundColor: color,
     fill: (fillColor && i === 0) ? 'origin' : false,
-    tension: 0.3, spanGaps: false, order: 1,
+    tension: 0.4, spanGaps: false, order: 1,
   }));
 
-  for (let i = 0; i + 1 < segs.length; i++) {
-    const a = segs[i][segs[i].length - 1], b = segs[i + 1][0];
+  for (let i = 0; i + 1 < smoothedSegs.length; i++) {
+    const a = smoothedSegs[i][smoothedSegs[i].length - 1], b = smoothedSegs[i + 1][0];
     ds.push({ data: [a, b], borderColor: color, backgroundColor: 'rgba(0,0,0,0)',
       borderWidth: 1.5, borderDash: [6, 5], pointRadius: 0,
       fill: false, tension: 0, spanGaps: true, order: 2 });
@@ -718,7 +771,7 @@ async function loadData() {
     const r = await fetch('/api/data');
     const d = await r.json();
     cachedLog = d.log;
-    updateCards(d.log);
+    updateCards(d);
     renderChart(currentDays);
     renderLog(d.log);
   } catch(e) { console.error(e); }

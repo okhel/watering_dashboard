@@ -25,6 +25,8 @@ pub struct LogEntry {
 pub struct ApiData {
     pub log: Vec<LogEntry>,
     pub online: bool,
+    /// Scheduled time of the next auto-watering event (RFC 3339, local tz).
+    pub next_water_at: String,
 }
 
 /// Request body for POST /api/water.
