@@ -13,7 +13,9 @@
     <span class="pill offline" id="pill"><span class="dot"></span><span id="pill-text">offline</span></span>
   </div>
   <div class="main-with-plant">
-    <img class="plant-img" id="plant-img" src="/plant/original" alt="plant">
+    <div class="plant-tile">
+      <img class="plant-img" id="plant-img" src="/plant/original" alt="plant">
+    </div>
     <div class="cards-wrapper">
       <div class="cards-top">
         <div class="card">
@@ -35,10 +37,10 @@
       </div>
       <div class="cards-bottom">
         <div class="btn-tile btn-water">
-          <button onclick="sendWater(22)">Water now (22 s)</button>
+          <button id="btn-water" onclick="sendWater(22, 'water')">Water now (22 s)</button>
         </div>
         <div class="btn-tile btn-test">
-          <button onclick="sendWater(3)">Test pump (3 s)</button>
+          <button id="btn-test"  onclick="sendWater(3, 'test')">Test pump (3 s)</button>
         </div>
       </div>
     </div>
@@ -49,7 +51,6 @@
       <div class="section-legend">
         <span class="legend-item"><span class="legend-swatch legend-shallow"></span>shallow</span>
         <span class="legend-item"><span class="legend-swatch legend-deep"></span>deep</span>
-        <span class="legend-item"><span class="legend-swatch legend-dashed"></span>gap</span>
         <span class="legend-item"><span class="legend-swatch legend-water"></span>watered</span>
       </div>
     </div>
@@ -79,8 +80,8 @@ let chart = null;
 function moistureLevel(adc) {
   if (adc < 700)  return { level: 'drenched', cls: 'word-drenched' };
   if (adc < 1400) return { level: 'wet',      cls: 'word-wet'      };
-  if (adc < 2400) return { level: 'happy',    cls: 'word-happy'    };
-  if (adc < 3400) return { level: 'dry',      cls: 'word-dry'      };
+  if (adc < 2200) return { level: 'happy',    cls: 'word-happy'    };
+  if (adc < 3000) return { level: 'dry',      cls: 'word-dry'      };
   return                  { level: 'parched', cls: 'word-parched' };
 }
 
@@ -334,11 +335,68 @@ async function loadData() {
     updateCards(d);
     renderChart(currentDays);
     renderLog(d.log);
+    checkPumpEchoes(d.log);
   } catch(e) { console.error(e); }
 }
 
-async function sendWater(duration_s) {
-  await fetch('/api/water', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({duration_s}) });
+const BTN_LABELS = {
+  water: { idle: 'Water now (22 s)', busy: 'Watering...' },
+  test:  { idle: 'Test pump (3 s)',  busy: 'Testing pump...' },
+};
+
+// Per-button pending state — reverts when a matching Pump echo appears.
+// { kind: { since: ms, duration: s, fallback: timeoutId } }
+const pendingPump = {};
+
+function resetButton(kind) {
+  const btn    = document.getElementById('btn-' + kind);
+  const labels = BTN_LABELS[kind];
+  btn.disabled    = false;
+  btn.textContent = labels.idle;
+  btn.classList.remove('busy');
+  if (pendingPump[kind]) {
+    clearTimeout(pendingPump[kind].fallback);
+    delete pendingPump[kind];
+  }
+}
+
+// Called from loadData. If a Pump event with matching duration appeared
+// after our click, the action completed → reset that button.
+function checkPumpEchoes(log) {
+  const pumps = log.filter(e => e.message.Pump);
+  for (const kind of Object.keys(pendingPump)) {
+    const { since, duration } = pendingPump[kind];
+    const echo = pumps.find(p =>
+      new Date(p.timestamp).getTime() >= since - 2000 &&
+      p.message.Pump.duration_s === duration);
+    if (echo) resetButton(kind);
+  }
+}
+
+async function sendWater(duration_s, kind) {
+  const btn    = document.getElementById('btn-' + kind);
+  const labels = BTN_LABELS[kind];
+  btn.disabled    = true;
+  btn.textContent = labels.busy;
+  btn.classList.add('busy');
+
+  // Safety net: if the echo never arrives (offline / lost / etc.),
+  // give up after 3× duration so the button isn't stuck forever.
+  const since    = Date.now();
+  const fallback = setTimeout(() => {
+    if (pendingPump[kind] && pendingPump[kind].since === since) {
+      console.warn('pump echo timeout for', kind);
+      resetButton(kind);
+    }
+  }, Math.max(15000, duration_s * 3000));
+  pendingPump[kind] = { since, duration: duration_s, fallback };
+
+  try {
+    await fetch('/api/water', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({duration_s}) });
+  } catch(e) {
+    console.error(e);
+    resetButton(kind);
+  }
 }
 
 loadData();
