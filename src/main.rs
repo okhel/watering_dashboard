@@ -9,20 +9,22 @@ use axum::http::StatusCode;
 use axum::response::Html;
 mod config;
 mod types;
-use config::{AUTO_WATER_DURATION_S, AUTO_WATER_INTERVAL_SECS, BIND_ADDR, CSV_PATH, HTTP_ADDR, LIVENESS_SECS, RAW_WINDOW_SECS, RETAIN_SECS};
+use config::{LIVENESS_SECS, PlantConfig, RAW_WINDOW_SECS, RETAIN_SECS};
 use types::{ApiData, Depth, LogEntry, Message, WaterRequest};
 
 struct SharedState {
     log:             Mutex<Vec<LogEntry>>,
     node_tx:         Mutex<Option<mpsc::Sender<u16>>>,
     written_buckets: Mutex<std::collections::HashSet<(i64, bool)>>,
+    plant:           &'static PlantConfig,
 }
 
 // --- Node communication (TCP) ---
 
 fn node_listener(state: Arc<SharedState>) {
-    let listener = TcpListener::bind(BIND_ADDR).expect("TCP bind failed");
-    println!("TCP  listening on {BIND_ADDR}");
+    let bind_addr = state.plant.bind_addr;
+    let listener = TcpListener::bind(bind_addr).expect("TCP bind failed");
+    println!("TCP  listening on {bind_addr}");
 
     for stream in listener.incoming() {
         match stream {
@@ -82,7 +84,7 @@ fn node_session(stream: TcpStream, state: &Arc<SharedState>) -> std::io::Result<
                 let entry = LogEntry { timestamp: Local::now().to_rfc3339(), message: msg };
                 // Pump events are sparse — flush immediately to CSV
                 if matches!(entry.message, Message::Pump { .. }) {
-                    append_csv_rows(&[entry.clone()]);
+                    append_csv_rows(state.plant.csv_path, &[entry.clone()]);
                 }
                 let sealed = {
                     let mut log     = state.log.lock().unwrap();
@@ -90,7 +92,7 @@ fn node_session(stream: TcpStream, state: &Arc<SharedState>) -> std::io::Result<
                     log.push(entry);
                     compact_log(&mut log, &mut written)
                 };
-                if !sealed.is_empty() { append_csv_rows(&sealed); }
+                if !sealed.is_empty() { append_csv_rows(state.plant.csv_path, &sealed); }
             }
             Err(e) => eprintln!("decode error ({len} bytes): {e}"),
         }
@@ -209,10 +211,10 @@ fn auto_water_checker(state: Arc<SharedState>) {
         };
 
         let elapsed = Local::now().timestamp() - reference;
-        if elapsed >= AUTO_WATER_INTERVAL_SECS {
+        if elapsed >= state.plant.auto_water_interval_secs {
             let tx = state.node_tx.lock().unwrap();
             if let Some(tx) = tx.as_ref() {
-                tx.send(AUTO_WATER_DURATION_S).ok();
+                tx.send(state.plant.auto_water_duration_s).ok();
                 println!("[{}] Auto-water sent ({} days since last)",
                     Local::now().format("%H:%M:%S"), elapsed / 86400);
             }
@@ -222,12 +224,12 @@ fn auto_water_checker(state: Arc<SharedState>) {
 
 // --- CSV persistence ---
 
-fn load_csv() -> (Vec<LogEntry>, std::collections::HashSet<(i64, bool)>) {
+fn load_csv(path: &str) -> (Vec<LogEntry>, std::collections::HashSet<(i64, bool)>) {
     use std::io::BufRead;
     let mut entries: Vec<LogEntry> = Vec::new();
     let mut written: std::collections::HashSet<(i64, bool)> = std::collections::HashSet::new();
 
-    let Ok(file) = std::fs::File::open(CSV_PATH) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return (entries, written); // first run — no file yet
     };
 
@@ -268,13 +270,13 @@ fn load_csv() -> (Vec<LogEntry>, std::collections::HashSet<(i64, bool)>) {
     (entries, written)
 }
 
-fn append_csv_rows(entries: &[LogEntry]) {
+fn append_csv_rows(path: &str, entries: &[LogEntry]) {
     use std::io::Write as _;
-    let needs_header = !std::path::Path::new(CSV_PATH).exists();
+    let needs_header = !std::path::Path::new(path).exists();
     let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true).append(true).open(CSV_PATH)
+        .create(true).append(true).open(path)
     else {
-        eprintln!("CSV: could not open {CSV_PATH} for writing");
+        eprintln!("CSV: could not open {path} for writing");
         return;
     };
     if needs_header {
@@ -296,16 +298,22 @@ fn append_csv_rows(entries: &[LogEntry]) {
 
 // --- Dashboard API (HTTP) ---
 
-async fn serve_dashboard() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+async fn serve_dashboard(State(state): State<Arc<SharedState>>) -> Html<String> {
+    Html(DASHBOARD_HTML.replace("{{PLANT}}", state.plant.display_name))
 }
 
-async fn serve_yucca() -> impl axum::response::IntoResponse {
-    let bytes = include_bytes!("../yucca.png");
-    (
-        [(axum::http::header::CONTENT_TYPE, "image/png")],
-        bytes.as_slice(),
-    )
+async fn serve_plant_image(State(state): State<Arc<SharedState>>) -> impl axum::response::IntoResponse {
+    match tokio::fs::read(state.plant.image_path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "image/png")],
+            bytes,
+        ),
+        Err(e) => {
+            eprintln!("could not read {}: {e}", state.plant.image_path);
+            (StatusCode::NOT_FOUND, [(axum::http::header::CONTENT_TYPE, "image/png")], Vec::new())
+        }
+    }
 }
 
 async fn get_event_log(State(state): State<Arc<SharedState>>) -> Json<ApiData> {
@@ -333,11 +341,13 @@ async fn post_water_command(
 
 #[tokio::main]
 async fn main() {
-    let (initial_log, initial_written) = load_csv();
+    let plant = config::from_args();
+    let (initial_log, initial_written) = load_csv(plant.csv_path);
     let state = Arc::new(SharedState {
         log:             Mutex::new(initial_log),
         node_tx:         Mutex::new(None),
         written_buckets: Mutex::new(initial_written),
+        plant,
     });
 
     let state_node  = Arc::clone(&state);
@@ -347,13 +357,14 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(serve_dashboard))
-        .route("/yucca.png", get(serve_yucca))
+        .route("/plant.png", get(serve_plant_image))
         .route("/api/data", get(get_event_log))
         .route("/api/water", post(post_water_command))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(HTTP_ADDR).await.unwrap();
-    println!("HTTP dashboard on http://{HTTP_ADDR}");
+    let http_addr = plant.http_addr;
+    let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+    println!("HTTP dashboard for '{}' on http://{http_addr}", plant.name);
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -362,7 +373,7 @@ const DASHBOARD_HTML: &str = r#####"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Garden dashboard</title>
+<title>{{PLANT}} dashboard</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; }
@@ -425,11 +436,11 @@ body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; 
 <body>
 <div class="container">
   <div class="topbar">
-    <span class="title">Yucca palm</span>
+    <span class="title">{{PLANT}}</span>
     <span class="pill offline" id="pill"><span class="dot"></span><span id="pill-text">offline</span></span>
   </div>
   <div class="main-with-plant">
-    <img class="plant-img" src="/yucca.png" alt="Yucca palm">
+    <img class="plant-img" src="/plant.png" alt="plant">
     <div class="cards-wrapper">
       <div class="cards-top">
         <div class="card">
