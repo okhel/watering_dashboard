@@ -1,0 +1,56 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #f5f5f2; color: #1a1a18; }
+.container { max-width: 860px; margin: 0 auto; padding: 2rem 1rem; }
+.topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+.title { font-size: 20px; font-weight: 500; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 4px 12px; border-radius: 999px; border: 1px solid; }
+.pill.online  { color: #0f6e56; background: #e1f5ee; border-color: #9fe1cb; }
+.pill.offline { color: #993c1d; background: #faece7; border-color: #f5c4b3; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.cards-top    { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.card { background: #ebebea; border-radius: 8px; padding: 1rem; }
+.card-label { font-size: 13px; color: #5f5e5a; margin-bottom: 6px; }
+.card-value { font-size: 24px; font-weight: 500; }
+.card-sub { font-size: 12px; color: #888780; margin-top: 4px; }
+.btn-tile { border-radius: 8px; overflow: hidden; }
+.btn-tile button { display: block; width: 100%; min-height: 72px; border: none; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; font-family: inherit; }
+.btn-water button { background: #e1f5ee; color: #27500a; }
+.btn-water button:hover { background: #9fe1cb; }
+.btn-test button  { background: #d3d1c7; color: #444441; border: none; }
+.btn-test button:hover  { background: #b4b2a9; }
+.section { background: white; border: 1px solid #e8e8e4; border-radius: 12px; padding: 1.25rem; margin-bottom: 1.5rem; }
+.section-label { font-size: 13px; color: #5f5e5a; font-weight: 500; margin-bottom: 12px; }
+.log-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #f1efe8; font-size: 13px; }
+.log-row:last-child { border-bottom: none; }
+.log-time { color: #888780; min-width: 130px; font-variant-numeric: tabular-nums; }
+.log-badge { font-size: 11px; padding: 2px 8px; border-radius: 6px; font-weight: 500; min-width: 64px; text-align: center; }
+.badge-moisture { background: #eaf3de; color: #3b6d11; }
+.badge-pump { background: #e1f5ee; color: #0f6e56; }
+.log-msg { color: #1a1a18; }
+.empty { color: #888780; font-size: 13px; }
+.main-with-plant { display: flex; gap: 12px; align-items: stretch; margin-bottom: 1.5rem; }
+.plant-img { width: 150px; flex-shrink: 0; border-radius: 8px; object-fit: cover; object-position: center; }
+.cards-wrapper { flex: 1; min-width: 0; }
+.cards-bottom { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.section-legend { display: flex; gap: 14px; font-size: 11px; color: #888780; align-items: center; }
+.legend-item { display: flex; align-items: center; gap: 5px; }
+.legend-swatch { width: 20px; height: 2px; display: inline-block; }
+.legend-solid   { background: #639922; }
+.legend-shallow { background: #639922; }
+.legend-deep    { background: #2d5c0e; }
+.legend-dashed  { background: repeating-linear-gradient(90deg,#639922 0 5px,transparent 5px 9px); }
+.legend-water   { background: repeating-linear-gradient(90deg,#3b7bbf 0 4px,transparent 4px 8px); }
+.slider-wrap { margin-top: 14px; }
+.slider-row { display: flex; align-items: center; gap: 10px; }
+.slider-row label { font-size: 12px; color: #5f5e5a; white-space: nowrap; }
+.slider-row input[type=range] { flex: 1; accent-color: #639922; cursor: pointer; }
+.slider-val { font-size: 12px; color: #5f5e5a; min-width: 30px; text-align: right; }
+.slider-ticks { display: flex; justify-content: space-between; font-size: 10px; color: #aaa; padding: 2px 2px 0; }
+.card-word { font-size: 12px; font-weight: 500; margin-top: 5px; }
+.word-waterlogged { color: #0d5c8c; }
+.word-soaked      { color: #1976a8; }
+.word-happy       { color: #2e7d32; }
+.word-thirsty     { color: #b07a00; }
+.word-dry         { color: #c0530a; }
+.word-parched     { color: #b71c1c; }
