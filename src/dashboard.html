@@ -13,7 +13,7 @@
     <span class="pill offline" id="pill"><span class="dot"></span><span id="pill-text">offline</span></span>
   </div>
   <div class="main-with-plant">
-    <img class="plant-img" src="/plant.png" alt="plant">
+    <img class="plant-img" id="plant-img" src="/plant/original" alt="plant">
     <div class="cards-wrapper">
       <div class="cards-top">
         <div class="card">
@@ -74,13 +74,14 @@
 <script>
 let chart = null;
 
-function moistureWord(adc) {
-  if (adc < 700)  return { word: 'waterlogged', cls: 'word-waterlogged' };
-  if (adc < 1400) return { word: 'soaked',      cls: 'word-soaked'      };
-  if (adc < 2600) return { word: 'happy',        cls: 'word-happy'       };
-  if (adc < 3100) return { word: 'thirsty',      cls: 'word-thirsty'     };
-  if (adc < 3600) return { word: 'dry',           cls: 'word-dry'         };
-  return                  { word: 'parched',      cls: 'word-parched'     };
+// Five-level moisture state. Name must match the suffix of pics/<plant>_<level>.png.
+// Higher ADC = drier soil.
+function moistureLevel(adc) {
+  if (adc < 700)  return { level: 'drenched', cls: 'word-drenched' };
+  if (adc < 1400) return { level: 'wet',      cls: 'word-wet'      };
+  if (adc < 2400) return { level: 'happy',    cls: 'word-happy'    };
+  if (adc < 3400) return { level: 'dry',      cls: 'word-dry'      };
+  return                  { level: 'parched', cls: 'word-parched' };
 }
 
 function timeSince(iso) {
@@ -115,10 +116,11 @@ function updateCards(data) {
     const adc = last.message.Moisture.adc_raw;
     document.getElementById('c-moisture').textContent = adc.toLocaleString('no-NO');
     document.getElementById('c-moisture-sub').textContent = timeSince(last.timestamp);
-    const mw = moistureWord(adc);
+    const ml = moistureLevel(adc);
     const wordEl = document.getElementById('c-moisture-word');
-    wordEl.textContent = mw.word;
-    wordEl.className = 'card-word ' + mw.cls;
+    wordEl.textContent = ml.level;
+    wordEl.className = 'card-word ' + ml.cls;
+    document.getElementById('plant-img').src = '/plant/' + ml.level;
   }
 
   // Online pill — server is the source of truth.

@@ -315,15 +315,20 @@ async fn serve_dashboard_css() -> impl axum::response::IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")], DASHBOARD_CSS)
 }
 
-async fn serve_plant_image(State(state): State<Arc<SharedState>>) -> impl axum::response::IntoResponse {
-    match tokio::fs::read(state.plant.image_path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "image/png")],
-            bytes,
-        ),
+const ALLOWED_LEVELS: &[&str] = &["drenched", "wet", "happy", "dry", "parched", "original"];
+
+async fn serve_plant_image(
+    State(state): State<Arc<SharedState>>,
+    axum::extract::Path(level): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    if !ALLOWED_LEVELS.contains(&level.as_str()) {
+        return (StatusCode::NOT_FOUND, [(axum::http::header::CONTENT_TYPE, "image/png")], Vec::new());
+    }
+    let path = format!("pics/{}_{}.png", state.plant.name, level);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "image/png")], bytes),
         Err(e) => {
-            eprintln!("could not read {}: {e}", state.plant.image_path);
+            eprintln!("could not read {path}: {e}");
             (StatusCode::NOT_FOUND, [(axum::http::header::CONTENT_TYPE, "image/png")], Vec::new())
         }
     }
@@ -377,7 +382,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(serve_dashboard))
         .route("/dashboard.css", get(serve_dashboard_css))
-        .route("/plant.png", get(serve_plant_image))
+        .route("/plant/:level", get(serve_plant_image))
         .route("/api/data", get(get_event_log))
         .route("/api/water", post(post_water_command))
         .with_state(state);

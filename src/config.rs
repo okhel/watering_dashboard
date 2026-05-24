@@ -1,11 +1,14 @@
 // Per-plant settings selected at startup by CLI flag.
+//
+// Plant images live in `pics/{name}_{level}.png`, where level ∈
+// {drenched, wet, happy, dry, parched, original}. The dashboard picks
+// the level at render time from the latest moisture reading.
 pub struct PlantConfig {
-    pub name:                     &'static str,  // lowercase identifier (logs, CLI)
+    pub name:                     &'static str,  // lowercase identifier (logs, CLI, image filenames)
     pub display_name:             &'static str,  // shown in the dashboard UI
     pub bind_addr:                &'static str,  // TCP port the ESP32 connects to
     pub http_addr:                &'static str,  // HTTP port for the dashboard UI
     pub csv_path:                 &'static str,
-    pub image_path:               &'static str,
     pub auto_water_interval_secs: i64,
     pub auto_water_duration_s:    u16,
 }
@@ -16,7 +19,6 @@ pub const YUCCA: PlantConfig = PlantConfig {
     bind_addr:                "0.0.0.0:5000",
     http_addr:                "0.0.0.0:8080",
     csv_path:                 "yucca_log.csv",
-    image_path:               "yucca.png",
     auto_water_interval_secs: 14 * 24 * 3600, // 2 weeks
     auto_water_duration_s:    22,
 };
@@ -27,7 +29,6 @@ pub const MONSTERA: PlantConfig = PlantConfig {
     bind_addr:                "0.0.0.0:5001",
     http_addr:                "0.0.0.0:8081",
     csv_path:                 "monstera_log.csv",
-    image_path:               "monstera.png",
     auto_water_interval_secs: 10 * 24 * 3600, // 10 days — slightly more frequent than yucca
     auto_water_duration_s:    22,             // same pot, same fill
 };
